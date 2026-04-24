@@ -15,15 +15,42 @@ This approach is based on the procedure described in:
 The script performs the following steps:
 
 1. **Process an audio file and identify speech** — load the audio and apply voice activity detection to isolate speech regions from silence/noise.
+
 2. **Identify sustained vowel segments** — within the speech regions, detect parts where the participant sustains a vowel sound (e.g., holds "aa" for at least 80 ms). This requires segmenting by phoneme and filtering for vowels that persist above the minimum duration threshold. *This step is expected to be the bulk of the work.*
-3. **Extract voice parameters** — compute jitter, shimmer, and harmonicity (HNR) from each identified sustained-vowel segment using an open-source voice analysis tool (e.g., Praat via Parselmouth, or openSMILE).
+
+   One of the intermediate formats produced by this step is a per-vowel table:
+
+   | filename | phoneme | start | end | duration |
+   |---|---|---|---|---|
+
+3. **Extract voice parameters** — compute jitter, shimmer, and harmonicity (HNR) from each identified sustained-vowel segment using an open-source voice analysis tool (e.g., Praat via Parselmouth, or openSMILE). The per-vowel table is extended with the measured values:
+
+   | filename | phoneme | start | end | duration | jitter | shimmer | hnr |
+   |---|---|---|---|---|---|---|---|
+
 4. **Average across the file** — aggregate the per-segment values into a single set of values per participant (per audio file).
+
 5. **Store output as CSV** — write one row per participant with the averaged jitter, shimmer, and harmonicity values.
 
 ## Input / Output
 
 - **Input:** audio file(s) of continuous speech (one per participant).
-- **Output:** a CSV file with columns for participant ID, mean jitter, mean shimmer, and mean harmonicity.
+- **Output:** a CSV file with one row per file:
+
+  | filename | n_vowels | mean_jitter_local_pct | mean_shimmer_local_db | mean_hnr_db |
+  |---|---|---|---|---|
+
+### Output column reference
+
+| Column | Quantity | Unit | Notes |
+|---|---|---|---|
+| `filename` | Source audio/video filename | — | Unambiguous identifier; use full path or participant ID if filenames collide across folders. |
+| `n_vowels` | Number of sustained vowel segments aggregated | count | Qualifying segments (≥ 80 ms) used in the averages. |
+| `mean_jitter_local_pct` | Mean of Praat's *jitter (local)* across vowels | % | Average absolute difference between consecutive periods, divided by the average period. |
+| `mean_shimmer_local_db` | Mean of Praat's *shimmer (local, dB)* across vowels | dB | Average absolute base-10 log ratio of amplitudes between consecutive periods, times 20. |
+| `mean_hnr_db` | Mean harmonics-to-noise ratio across vowels | dB | Praat's HNR from autocorrelation. |
+
+Jitter and shimmer have multiple standard variants (e.g. `jitter_rap`, `jitter_ppq5`, `shimmer_apq3`, `shimmer_apq5`). The columns above specify which variant is used; change the column names if you change the variant.
 
 ## Configurable parameters
 
