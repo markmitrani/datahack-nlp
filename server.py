@@ -20,6 +20,7 @@ import pandas as pd
 import soundfile as sf
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -209,6 +210,11 @@ def filtered_segments_endpoint(req: AggregateRequest) -> list[dict[str, Any]]:
             if isinstance(v, float) and math.isnan(v):
                 row[k] = None
     return records
+
+
+@app.get("/")
+def root() -> RedirectResponse:
+    return RedirectResponse(url="/phoneme_player.html")
 
 
 # Serve static files last so API routes take priority
