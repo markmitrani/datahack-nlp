@@ -19,6 +19,50 @@
   #status { color: #666; font-size: .85rem; min-height: 1.2em; }
   audio { width: 100%; margin-top: 1rem; }
   .hint { color: #888; font-size: .8rem; }
+
+  /* ── Metrics section ──────────────────────────────────────────── */
+  #metrics-section { margin-top: 2rem; border-top: 1px solid #ddd; padding-top: 1.5rem; display: none; }
+  #metrics-section h2 { font-size: 1.1rem; margin: 0 0 .75rem; }
+  #hist-canvas { display: block; border: 1px solid #e2e2e2; border-radius: 4px; background: #fafafa; }
+  .range-wrap { position: relative; height: 36px; margin-top: .5rem; user-select: none; }
+  .range-wrap input[type=range] {
+    position: absolute; width: 100%; pointer-events: none;
+    -webkit-appearance: none; appearance: none; background: transparent; height: 4px;
+    top: 50%; transform: translateY(-50%);
+  }
+  .range-wrap input[type=range]::-webkit-slider-thumb {
+    pointer-events: all; -webkit-appearance: none; appearance: none;
+    width: 16px; height: 16px; border-radius: 50%;
+    background: #2563eb; cursor: pointer; border: 2px solid white;
+    box-shadow: 0 0 0 1px #2563eb;
+  }
+  .range-wrap input[type=range]::-webkit-slider-runnable-track { background: transparent; }
+  .range-track { position: absolute; height: 4px; top: 50%; transform: translateY(-50%);
+    background: #ddd; width: 100%; border-radius: 2px; }
+  .range-fill  { position: absolute; height: 4px; top: 50%; transform: translateY(-50%);
+    background: #2563eb; border-radius: 2px; }
+  #range-label { font-size: .82rem; color: #444; margin-top: .3rem; }
+  .metrics-btn {
+    margin-top: 1rem; padding: .45rem 1rem; font-size: .9rem;
+    background: #2563eb; color: white; border: none;
+    border-radius: 5px; cursor: pointer; font-family: inherit;
+  }
+  .metrics-btn:disabled { background: #93a8d4; cursor: not-allowed; }
+  .metrics-btn + .metrics-btn { margin-left: .5rem; }
+  #metrics-status { font-size: .82rem; color: #666; margin-top: .5rem; min-height: 1.2em; }
+  .metrics-table-wrap {
+    max-height: 500px; overflow-y: scroll; margin-top: 1rem;
+    border: 1px solid #ddd; border-radius: 4px;
+  }
+  .metrics-table-wrap table { border-collapse: collapse; width: 100%; font-size: .82rem; }
+  .metrics-table-wrap th {
+    font-weight: bold; background: #f0f4ff; padding: .4rem .6rem;
+    border-bottom: 2px solid #c7d2fe; text-align: left; position: sticky; top: 0; z-index: 1;
+  }
+  .metrics-table-wrap td { padding: .35rem .6rem; border-bottom: 1px solid #eee; }
+  .metrics-table-wrap tr:nth-child(even) td { background: #f7f7f7; }
+  .metrics-table-wrap tr:nth-child(odd)  td { background: white; }
+  .agg-label { font-size: .85rem; font-weight: bold; margin-top: 1.5rem; margin-bottom: .25rem; }
 </style>
 </head>
 <body>
@@ -42,6 +86,29 @@
 <audio id="player" controls preload="metadata"></audio>
 
 <p class="hint">Click a phoneme to see all its occurrences, then click any occurrence to play that segment. The browser reads both files locally — nothing is uploaded.</p>
+
+<div id="metrics-section">
+  <h2>Acoustic metrics</h2>
+  <canvas id="hist-canvas" width="820" height="120"></canvas>
+  <div class="range-wrap" id="range-wrap">
+    <div class="range-track"></div>
+    <div class="range-fill" id="range-fill"></div>
+    <input type="range" id="range-min" min="0" max="1000" step="1" value="0">
+    <input type="range" id="range-max" min="0" max="1000" step="1" value="1000">
+  </div>
+  <div id="range-label">
+    Min: <span id="lbl-min">0</span> ms &nbsp;&ndash;&nbsp; Max: <span id="lbl-max">0</span> ms
+    &nbsp;|&nbsp; <span id="lbl-count">0</span> segments selected
+  </div>
+  <div>
+    <button class="metrics-btn" id="btn-compute" disabled>Compute metrics</button>
+    <button class="metrics-btn" id="btn-aggregate" disabled>Compute aggregate</button>
+  </div>
+  <div id="metrics-status"></div>
+  <div class="metrics-table-wrap" id="metrics-table-wrap" style="display:none"></div>
+  <div class="agg-label" id="agg-label" style="display:none">Per-file aggregate</div>
+  <div class="metrics-table-wrap" id="agg-table-wrap" style="display:none"></div>
+</div>
 
 <script>
   const $csv = document.getElementById("csvInput");
@@ -175,6 +242,245 @@
     $player.src = URL.createObjectURL(f);
     $status.textContent = `Audio: ${f.name}`;
   });
+</script>
+
+<script>
+  // ── Metrics extension ─────────────────────────────────────────────────────
+  // All state and logic is self-contained here; zero lines above are modified.
+
+  let audioFile = null;
+  let csvName   = "phonemes";
+  let _sliderMinMs = 0, _sliderMaxMs = 1000;
+  let _allDurations = [];
+
+  // Keep the raw File object so we can POST it to the server
+  document.getElementById("audioInput").addEventListener("change", e => {
+    audioFile = e.target.files[0] || null;
+  });
+
+  // Capture the CSV filename for output naming
+  document.getElementById("csvInput").addEventListener("change", e => {
+    const f = e.target.files[0];
+    if (f) csvName = f.name.replace(/\.[^.]+$/, "");
+  });
+
+  // Monkey-patch renderPhonemes so we can react after rows are populated
+  // without modifying any existing code.
+  const _origRenderPhonemes = renderPhonemes;
+  renderPhonemes = function () {
+    _origRenderPhonemes();
+    if (rows.length > 0) _metricsInit();
+  };
+
+  function _metricsInit() {
+    _allDurations = rows.map(r => (r.end - r.start) * 1000);
+    const minDur = Math.min(..._allDurations);
+    const maxDur = Math.max(..._allDurations);
+    _initSlider(minDur, maxDur);
+    _drawHistogram(_allDurations, minDur, maxDur);
+    document.getElementById("metrics-section").style.display = "block";
+    document.getElementById("btn-compute").disabled = false;
+    document.getElementById("btn-aggregate").disabled = true;
+    document.getElementById("metrics-status").textContent = "";
+    document.getElementById("metrics-table-wrap").style.display = "none";
+    document.getElementById("agg-table-wrap").style.display = "none";
+    document.getElementById("agg-label").style.display = "none";
+  }
+
+  // ── Histogram ──────────────────────────────────────────────────────────────
+
+  function _drawHistogram(durations, minDur, maxDur, hlMin, hlMax) {
+    const canvas = document.getElementById("hist-canvas");
+    const ctx    = canvas.getContext("2d");
+    const W = canvas.width, H = canvas.height;
+    ctx.clearRect(0, 0, W, H);
+
+    const BIN = 10; // ms per bucket
+    const range = maxDur - minDur || 1;
+    const nBins = Math.ceil(range / BIN) + 1;
+    const counts = new Array(nBins).fill(0);
+    for (const d of durations) {
+      const b = Math.min(Math.floor((d - minDur) / BIN), nBins - 1);
+      counts[b]++;
+    }
+    const maxCount = Math.max(...counts, 1);
+    const pad = { l: 34, r: 8, t: 8, b: 20 };
+    const plotW = W - pad.l - pad.r;
+    const plotH = H - pad.t - pad.b;
+    const barW  = plotW / nBins;
+
+    // Y-axis labels
+    ctx.fillStyle = "#999";
+    ctx.font = "10px system-ui";
+    ctx.textAlign = "right";
+    ctx.fillText(maxCount, pad.l - 3, pad.t + 9);
+    ctx.fillText(0, pad.l - 3, pad.t + plotH);
+
+    // Bars
+    for (let i = 0; i < nBins; i++) {
+      const x    = pad.l + i * barW;
+      const barH = (counts[i] / maxCount) * plotH;
+      const binMin = minDur + i * BIN;
+      const binMax = binMin + BIN;
+      const inRange = hlMin === undefined || (binMax > hlMin && binMin < hlMax);
+      ctx.fillStyle = inRange ? "#2563eb" : "#c7d2fe";
+      ctx.fillRect(x, pad.t + plotH - barH, Math.max(barW - 1, 1), barH);
+    }
+
+    // X-axis ticks every 50 ms
+    ctx.fillStyle = "#999";
+    ctx.font = "9px system-ui";
+    ctx.textAlign = "center";
+    const step = range > 500 ? 100 : 50;
+    const first = Math.ceil(minDur / step) * step;
+    for (let ms = first; ms <= maxDur; ms += step) {
+      const x = pad.l + ((ms - minDur) / range) * plotW;
+      ctx.fillText(ms + "ms", x, H - 3);
+    }
+  }
+
+  // ── Dual-handle range slider ───────────────────────────────────────────────
+
+  function _initSlider(minDur, maxDur) {
+    const lo = Math.floor(minDur);
+    const hi = Math.ceil(maxDur);
+    const rMin = document.getElementById("range-min");
+    const rMax = document.getElementById("range-max");
+    [rMin, rMax].forEach(r => { r.min = lo; r.max = hi; r.step = 1; });
+    rMin.value = lo;
+    rMax.value = hi;
+    _sliderMinMs = lo;
+    _sliderMaxMs = hi;
+    _updateSliderUI();
+    rMin.oninput = _onSliderChange;
+    rMax.oninput = _onSliderChange;
+  }
+
+  function _onSliderChange() {
+    const rMin = document.getElementById("range-min");
+    const rMax = document.getElementById("range-max");
+    let lo = parseInt(rMin.value), hi = parseInt(rMax.value);
+    if (lo >= hi) { lo = hi - 1; rMin.value = lo; }
+    _sliderMinMs = lo;
+    _sliderMaxMs = hi;
+    _updateSliderUI();
+  }
+
+  function _updateSliderUI() {
+    const rMin  = document.getElementById("range-min");
+    const rMax  = document.getElementById("range-max");
+    const lo    = parseInt(rMin.value), hi = parseInt(rMax.value);
+    const total = parseInt(rMax.max) - parseInt(rMin.min) || 1;
+    const fillL = ((lo - parseInt(rMin.min)) / total) * 100;
+    const fillR = ((parseInt(rMax.max) - hi) / total) * 100;
+    const fill  = document.getElementById("range-fill");
+    fill.style.left  = fillL + "%";
+    fill.style.right = fillR + "%";
+    document.getElementById("lbl-min").textContent = lo;
+    document.getElementById("lbl-max").textContent = hi;
+
+    const count = rows.filter(r => {
+      const ms = (r.end - r.start) * 1000;
+      return ms >= lo && ms <= hi;
+    }).length;
+    document.getElementById("lbl-count").textContent = count;
+
+    const minDur = Math.min(..._allDurations);
+    const maxDur = Math.max(..._allDurations);
+    _drawHistogram(_allDurations, minDur, maxDur, lo, hi);
+  }
+
+  // ── Compute metrics ────────────────────────────────────────────────────────
+
+  document.getElementById("btn-compute").addEventListener("click", async () => {
+    const btn      = document.getElementById("btn-compute");
+    const statusEl = document.getElementById("metrics-status");
+
+    if (!audioFile) { statusEl.textContent = "Load an audio file first."; return; }
+
+    const filtered = rows.filter(r => {
+      const ms = (r.end - r.start) * 1000;
+      return ms >= _sliderMinMs && ms <= _sliderMaxMs;
+    });
+    if (!filtered.length) { statusEl.textContent = "No segments in the selected range."; return; }
+
+    const lines = ["phoneme,start,end,duration"];
+    for (const r of filtered) {
+      lines.push(`${r.phoneme},${r.start},${r.end},${((r.end - r.start) * 1000).toFixed(3)}`);
+    }
+
+    const form = new FormData();
+    form.append("audio_file", audioFile, audioFile.name);
+    form.append("csv_content", lines.join("\n"));
+    form.append("csv_name", csvName);
+
+    btn.disabled = true;
+    statusEl.textContent = `Computing metrics for ${filtered.length} segments…`;
+
+    try {
+      const resp = await fetch("/compute_metrics", { method: "POST", body: form });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+        throw new Error(err.detail || resp.statusText);
+      }
+      const data = await resp.json();
+      _renderTable("metrics-table-wrap", data);
+      document.getElementById("btn-aggregate").disabled = false;
+      statusEl.textContent = `Done — ${data.length} rows. Saved to output/${csvName}_metrics.csv`;
+    } catch (e) {
+      statusEl.textContent = "Error: " + e.message;
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  // ── Compute aggregate ──────────────────────────────────────────────────────
+
+  document.getElementById("btn-aggregate").addEventListener("click", async () => {
+    const btn      = document.getElementById("btn-aggregate");
+    const statusEl = document.getElementById("metrics-status");
+    btn.disabled   = true;
+    statusEl.textContent = "Computing aggregate…";
+
+    try {
+      const resp = await fetch("/compute_aggregate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ csv_name: csvName }),
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+        throw new Error(err.detail || resp.statusText);
+      }
+      const data = await resp.json();
+      document.getElementById("agg-label").style.display = "block";
+      _renderTable("agg-table-wrap", data);
+      statusEl.textContent = `Aggregate done — ${data.length} row(s). Saved to output/${csvName}_metrics_agg.csv`;
+    } catch (e) {
+      statusEl.textContent = "Error: " + e.message;
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  // ── Table rendering ────────────────────────────────────────────────────────
+
+  function _renderTable(wrapId, data) {
+    const wrap = document.getElementById(wrapId);
+    wrap.style.display = "block";
+    if (!data || !data.length) { wrap.innerHTML = "<p style='padding:.5rem'>No data.</p>"; return; }
+    const cols = Object.keys(data[0]);
+    const fmt  = v => {
+      if (v === null || v === undefined) return "&ndash;";
+      if (typeof v === "number") return isNaN(v) ? "&ndash;" : v.toFixed(4);
+      return String(v);
+    };
+    const head = "<tr>" + cols.map(c => `<th>${c}</th>`).join("") + "</tr>";
+    const body = data.map(r =>
+      "<tr>" + cols.map(c => `<td>${fmt(r[c])}</td>`).join("") + "</tr>"
+    ).join("");
+    wrap.innerHTML = `<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
+  }
 </script>
 
 </body>
