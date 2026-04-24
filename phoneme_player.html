@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Phoneme player</title>
+<style>
+  body { font: 14px/1.4 system-ui, sans-serif; max-width: 860px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+  h1 { margin: 0 0 1rem; font-size: 1.4rem; }
+  .row { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1rem; }
+  .row label { display: flex; flex-direction: column; gap: .25rem; font-size: .85rem; color: #555; }
+  .pickers input { font-size: .9rem; }
+  #phonemes { display: flex; flex-wrap: wrap; gap: .3rem; margin: 1rem 0; }
+  #phonemes button { font-size: 1rem; padding: .3rem .6rem; border: 1px solid #ccc; background: #f7f7f7; border-radius: 4px; cursor: pointer; font-family: inherit; }
+  #phonemes button.active { background: #2563eb; color: white; border-color: #2563eb; }
+  #segments { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: .3rem; }
+  #segments button { font-size: .85rem; padding: .35rem; border: 1px solid #ddd; background: white; border-radius: 4px; cursor: pointer; font-family: ui-monospace, monospace; }
+  #segments button:hover { background: #eff6ff; border-color: #2563eb; }
+  #segments button.playing { background: #2563eb; color: white; border-color: #2563eb; }
+  #status { color: #666; font-size: .85rem; min-height: 1.2em; }
+  audio { width: 100%; margin-top: 1rem; }
+  .hint { color: #888; font-size: .8rem; }
+</style>
+</head>
+<body>
+
+<h1>Phoneme player</h1>
+
+<div class="row pickers">
+  <label>CSV (phoneme, start, end)
+    <input type="file" id="csvInput" accept=".csv">
+  </label>
+  <label>Audio / video (wav, mp3, mp4, …)
+    <input type="file" id="audioInput" accept="audio/*,video/*">
+  </label>
+</div>
+
+<div id="status">Pick a CSV and the matching recording to begin.</div>
+
+<div id="phonemes"></div>
+<div id="segments"></div>
+
+<audio id="player" controls preload="metadata"></audio>
+
+<p class="hint">Click a phoneme to see all its occurrences, then click any occurrence to play that segment. The browser reads both files locally — nothing is uploaded.</p>
+
+<script>
+  const $csv = document.getElementById("csvInput");
+  const $audio = document.getElementById("audioInput");
+  const $status = document.getElementById("status");
+  const $phonemes = document.getElementById("phonemes");
+  const $segments = document.getElementById("segments");
+  const $player = document.getElementById("player");
+
+  let rows = [];               // {phoneme, start, end}
+  let currentPhoneme = null;
+  let stopTimer = null;        // setTimeout id for auto-stop at segment end
+  let currentBtn = null;       // currently-playing segment button
+
+  // --- tiny CSV parser: handles quoted fields and commas inside quotes ---
+  function parseCSV(text) {
+    const out = [];
+    let i = 0, field = "", row = [], inQ = false;
+    while (i < text.length) {
+      const c = text[i];
+      if (inQ) {
+        if (c === '"' && text[i+1] === '"') { field += '"'; i += 2; continue; }
+        if (c === '"') { inQ = false; i++; continue; }
+        field += c; i++;
+      } else {
+        if (c === '"') { inQ = true; i++; continue; }
+        if (c === ',') { row.push(field); field = ""; i++; continue; }
+        if (c === '\n' || c === '\r') {
+          if (field.length || row.length) { row.push(field); out.push(row); }
+          field = ""; row = [];
+          if (c === '\r' && text[i+1] === '\n') i += 2; else i++;
+          continue;
+        }
+        field += c; i++;
+      }
+    }
+    if (field.length || row.length) { row.push(field); out.push(row); }
+    return out;
+  }
+
+  function loadCSV(file) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const table = parseCSV(reader.result);
+      if (!table.length) { $status.textContent = "Empty CSV."; return; }
+      const header = table[0].map(h => h.trim().toLowerCase());
+      const iP = header.indexOf("phoneme");
+      const iS = header.indexOf("start");
+      const iE = header.indexOf("end");
+      if (iP < 0 || iS < 0 || iE < 0) {
+        $status.textContent = `CSV must have columns: phoneme, start, end. Got: ${header.join(", ")}`;
+        return;
+      }
+      rows = [];
+      for (let k = 1; k < table.length; k++) {
+        const r = table[k];
+        if (!r[iP]) continue;
+        rows.push({
+          phoneme: r[iP],
+          start: parseFloat(r[iS]),
+          end:   parseFloat(r[iE]),
+        });
+      }
+      renderPhonemes();
+      $status.textContent = `Loaded ${rows.length} segments from ${file.name}`;
+    };
+    reader.readAsText(file);
+  }
+
+  function renderPhonemes() {
+    const counts = new Map();
+    for (const r of rows) counts.set(r.phoneme, (counts.get(r.phoneme) || 0) + 1);
+    // sort by count desc, then phoneme alpha
+    const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    $phonemes.innerHTML = "";
+    $segments.innerHTML = "";
+    currentPhoneme = null;
+    for (const [ph, n] of sorted) {
+      const b = document.createElement("button");
+      b.textContent = `${ph}  ·  ${n}`;
+      b.dataset.phoneme = ph;
+      b.onclick = () => selectPhoneme(ph, b);
+      $phonemes.appendChild(b);
+    }
+  }
+
+  function selectPhoneme(ph, btn) {
+    currentPhoneme = ph;
+    for (const el of $phonemes.children) el.classList.toggle("active", el.dataset.phoneme === ph);
+    $segments.innerHTML = "";
+    const matches = rows.filter(r => r.phoneme === ph);
+    for (const r of matches) {
+      const b = document.createElement("button");
+      const dur = ((r.end - r.start) * 1000).toFixed(0);
+      b.textContent = `${r.start.toFixed(2)}s  (${dur} ms)`;
+      b.onclick = () => play(r, b);
+      $segments.appendChild(b);
+    }
+    $status.textContent = `${ph}: ${matches.length} segments`;
+  }
+
+  function play(seg, btn) {
+    if (!$player.src) { $status.textContent = "Load an audio/video file first."; return; }
+    clearTimeout(stopTimer);
+    if (currentBtn) currentBtn.classList.remove("playing");
+    currentBtn = btn; btn.classList.add("playing");
+
+    $player.currentTime = seg.start;
+    const playPromise = $player.play();
+    const durMs = Math.max(40, (seg.end - seg.start) * 1000);
+    const stopAt = () => {
+      $player.pause();
+      if (currentBtn === btn) { btn.classList.remove("playing"); currentBtn = null; }
+    };
+    // + 30 ms safety margin so we hear the tail
+    stopTimer = setTimeout(stopAt, durMs + 30);
+    if (playPromise && playPromise.catch) playPromise.catch(e => {
+      $status.textContent = "Playback failed: " + e.message;
+    });
+  }
+
+  $csv.addEventListener("change", e => {
+    const f = e.target.files[0];
+    if (f) loadCSV(f);
+  });
+
+  $audio.addEventListener("change", e => {
+    const f = e.target.files[0];
+    if (!f) return;
+    if ($player.src) URL.revokeObjectURL($player.src);
+    $player.src = URL.createObjectURL(f);
+    $status.textContent = `Audio: ${f.name}`;
+  });
+</script>
+
+</body>
+</html>
