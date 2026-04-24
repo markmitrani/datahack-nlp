@@ -50,6 +50,17 @@
   .metrics-btn:disabled { background: #93a8d4; cursor: not-allowed; }
   .metrics-btn + .metrics-btn { margin-left: .5rem; }
   #metrics-status { font-size: .82rem; color: #666; margin-top: .5rem; min-height: 1.2em; }
+  .threshold-grid {
+    display: grid; grid-template-columns: repeat(2, 1fr); gap: .75rem 1.25rem;
+    margin-top: 1rem; padding: .75rem 1rem; background: #f9fafb;
+    border: 1px solid #e5e7eb; border-radius: 6px;
+  }
+  .threshold-grid label { display: flex; align-items: center; gap: .5rem; font-size: .85rem; }
+  .threshold-grid input[type=range] { flex: 1; }
+  .threshold-grid .thr-val { font-family: ui-monospace, monospace; min-width: 3.5em; text-align: right; color: #2563eb; font-weight: 600; }
+  .filename-picker { margin-top: 1rem; display: flex; align-items: center; gap: .5rem; font-size: .85rem; }
+  .filename-picker select { font-family: inherit; font-size: .85rem; padding: .25rem .4rem; }
+  #violin-canvas { display: block; border: 1px solid #e2e2e2; border-radius: 4px; background: #fafafa; margin-top: 1rem; width: 100%; max-width: 820px; }
   .metrics-table-wrap {
     max-height: 500px; overflow-y: scroll; margin-top: 1rem;
     border: 1px solid #ddd; border-radius: 4px;
@@ -80,6 +91,13 @@
 
 <div id="status">Pick a CSV and the matching recording to begin.</div>
 
+<div class="filename-picker" id="filename-picker" style="display:none">
+  <label>Filename filter:
+    <select id="filenameSelect"></select>
+  </label>
+  <span class="hint" id="filename-hint"></span>
+</div>
+
 <div id="phonemes"></div>
 <div id="segments"></div>
 
@@ -106,8 +124,32 @@
   </div>
   <div id="metrics-status"></div>
   <div class="metrics-table-wrap" id="metrics-table-wrap" style="display:none"></div>
+
+  <div class="agg-label" id="thr-label" style="display:none">Outlier thresholds (for aggregate)</div>
+  <div class="threshold-grid" id="threshold-grid" style="display:none">
+    <label>Min duration (ms)
+      <input type="range" id="thr-duration" min="0" max="500" step="5" value="80">
+      <span class="thr-val" id="thr-duration-val">80</span>
+    </label>
+    <label>Max jitter (%)
+      <input type="range" id="thr-jitter" min="0" max="50" step="0.5" value="16">
+      <span class="thr-val" id="thr-jitter-val">16</span>
+    </label>
+    <label>Max shimmer (%)
+      <input type="range" id="thr-shimmer" min="0" max="100" step="1" value="30">
+      <span class="thr-val" id="thr-shimmer-val">30</span>
+    </label>
+    <label>Min HNR (dB)
+      <input type="range" id="thr-hnr" min="-10" max="40" step="0.5" value="0">
+      <span class="thr-val" id="thr-hnr-val">0</span>
+    </label>
+  </div>
+
   <div class="agg-label" id="agg-label" style="display:none">Per-file aggregate</div>
   <div class="metrics-table-wrap" id="agg-table-wrap" style="display:none"></div>
+
+  <div class="agg-label" id="violin-label" style="display:none">Per-participant distribution (kept segments)</div>
+  <canvas id="violin-canvas" width="820" height="340" style="display:none"></canvas>
 </div>
 
 <script>
@@ -118,10 +160,12 @@
   const $segments = document.getElementById("segments");
   const $player = document.getElementById("player");
 
-  let rows = [];               // {phoneme, start, end}
+  let allRows = [];            // every row parsed from the CSV, incl. filename
+  let rows = [];               // rows filtered by the active filename (or all)
   let currentPhoneme = null;
   let stopTimer = null;        // setTimeout id for auto-stop at segment end
   let currentBtn = null;       // currently-playing segment button
+  let selectedFilename = null; // which filename is active, or null = "all"
 
   // --- tiny CSV parser: handles quoted fields and commas inside quotes ---
   function parseCSV(text) {
@@ -158,24 +202,68 @@
       const iP = header.indexOf("phoneme");
       const iS = header.indexOf("start");
       const iE = header.indexOf("end");
+      const iF = header.indexOf("filename");
       if (iP < 0 || iS < 0 || iE < 0) {
         $status.textContent = `CSV must have columns: phoneme, start, end. Got: ${header.join(", ")}`;
         return;
       }
-      rows = [];
+      allRows = [];
       for (let k = 1; k < table.length; k++) {
         const r = table[k];
         if (!r[iP]) continue;
-        rows.push({
+        allRows.push({
+          filename: iF >= 0 ? (r[iF] || "") : "",
           phoneme: r[iP],
           start: parseFloat(r[iS]),
           end:   parseFloat(r[iE]),
         });
       }
-      renderPhonemes();
-      $status.textContent = `Loaded ${rows.length} segments from ${file.name}`;
+      _rebuildFilenamePicker();
+      _applyFilenameFilter();
+      $status.textContent = `Loaded ${allRows.length} segments from ${file.name}` +
+        (iF >= 0 ? ` (${new Set(allRows.map(r => r.filename)).size} filename(s))` : "");
     };
     reader.readAsText(file);
+  }
+
+  function _rebuildFilenamePicker() {
+    const picker = document.getElementById("filename-picker");
+    const select = document.getElementById("filenameSelect");
+    const unique = [...new Set(allRows.map(r => r.filename).filter(x => x))];
+    if (unique.length === 0) {
+      picker.style.display = "none";
+      selectedFilename = null;
+      return;
+    }
+    picker.style.display = "flex";
+    select.innerHTML = "";
+    const optAll = document.createElement("option");
+    optAll.value = "__all__";
+    optAll.textContent = `All (${allRows.length} segments)`;
+    select.appendChild(optAll);
+    for (const fn of unique) {
+      const n = allRows.filter(r => r.filename === fn).length;
+      const o = document.createElement("option");
+      o.value = fn;
+      o.textContent = `${fn}  (${n})`;
+      select.appendChild(o);
+    }
+    // Default: pick the first real filename (common case: one participant at a time).
+    select.value = unique[0];
+    selectedFilename = unique[0];
+    document.getElementById("filename-hint").textContent =
+      "Pick the audio matching the selected filename before computing metrics.";
+    select.onchange = () => {
+      selectedFilename = select.value === "__all__" ? null : select.value;
+      _applyFilenameFilter();
+    };
+  }
+
+  function _applyFilenameFilter() {
+    rows = selectedFilename
+      ? allRows.filter(r => r.filename === selectedFilename)
+      : allRows.slice();
+    renderPhonemes();
   }
 
   function renderPhonemes() {
@@ -285,6 +373,38 @@
     document.getElementById("metrics-table-wrap").style.display = "none";
     document.getElementById("agg-table-wrap").style.display = "none";
     document.getElementById("agg-label").style.display = "none";
+    document.getElementById("thr-label").style.display = "block";
+    document.getElementById("threshold-grid").style.display = "grid";
+    document.getElementById("violin-canvas").style.display = "none";
+    document.getElementById("violin-label").style.display = "none";
+    _initThresholdSliders();
+  }
+
+  // ── Threshold sliders ──────────────────────────────────────────────────────
+
+  function _initThresholdSliders() {
+    const pairs = [
+      ["thr-duration", "thr-duration-val"],
+      ["thr-jitter",   "thr-jitter-val"],
+      ["thr-shimmer",  "thr-shimmer-val"],
+      ["thr-hnr",      "thr-hnr-val"],
+    ];
+    for (const [inputId, valId] of pairs) {
+      const el = document.getElementById(inputId);
+      const vEl = document.getElementById(valId);
+      const sync = () => { vEl.textContent = el.value; };
+      el.oninput = sync;
+      sync();
+    }
+  }
+
+  function _currentThresholds() {
+    return {
+      min_duration_ms: parseFloat(document.getElementById("thr-duration").value),
+      max_jitter_pct:  parseFloat(document.getElementById("thr-jitter").value),
+      max_shimmer:     parseFloat(document.getElementById("thr-shimmer").value),
+      min_hnr_db:      parseFloat(document.getElementById("thr-hnr").value),
+    };
   }
 
   // ── Histogram ──────────────────────────────────────────────────────────────
@@ -404,9 +524,12 @@
     });
     if (!filtered.length) { statusEl.textContent = "No segments in the selected range."; return; }
 
-    const lines = ["phoneme,start,end,duration"];
+    // Include filename column so the server can match CSV rows to the audio.
+    const audioName = audioFile.name;
+    const lines = ["filename,phoneme,start,end,duration"];
     for (const r of filtered) {
-      lines.push(`${r.phoneme},${r.start},${r.end},${((r.end - r.start) * 1000).toFixed(3)}`);
+      const fn = r.filename || audioName;
+      lines.push(`${fn},${r.phoneme},${r.start},${r.end},${((r.end - r.start) * 1000).toFixed(3)}`);
     }
 
     const form = new FormData();
@@ -442,26 +565,160 @@
     btn.disabled   = true;
     statusEl.textContent = "Computing aggregate…";
 
+    const thr = _currentThresholds();
+    const body = JSON.stringify({ csv_name: csvName, ...thr });
+
     try {
-      const resp = await fetch("/compute_aggregate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ csv_name: csvName }),
-      });
-      if (!resp.ok) {
-        const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-        throw new Error(err.detail || resp.statusText);
+      const [aggResp, segResp] = await Promise.all([
+        fetch("/compute_aggregate",   { method: "POST", headers: { "Content-Type": "application/json" }, body }),
+        fetch("/filtered_segments",   { method: "POST", headers: { "Content-Type": "application/json" }, body }),
+      ]);
+      if (!aggResp.ok) {
+        const err = await aggResp.json().catch(() => ({ detail: aggResp.statusText }));
+        throw new Error(err.detail || aggResp.statusText);
       }
-      const data = await resp.json();
+      const data = await aggResp.json();
       document.getElementById("agg-label").style.display = "block";
       _renderTable("agg-table-wrap", data);
-      statusEl.textContent = `Aggregate done — ${data.length} row(s). Saved to output/${csvName}_metrics_agg.csv`;
+
+      let kept = [];
+      if (segResp.ok) {
+        kept = await segResp.json();
+      }
+      _renderViolin(kept);
+      statusEl.textContent =
+        `Aggregate done — ${data.length} file(s), ${kept.length} segments kept ` +
+        `(min_dur=${thr.min_duration_ms}ms, max_jitter=${thr.max_jitter_pct}%, ` +
+        `max_shimmer=${thr.max_shimmer}, min_hnr=${thr.min_hnr_db}dB).`;
     } catch (e) {
       statusEl.textContent = "Error: " + e.message;
     } finally {
       btn.disabled = false;
     }
   });
+
+  // ── Violin / strip plot ────────────────────────────────────────────────────
+  // One panel per metric (jitter, shimmer, hnr). Within a panel, one column
+  // per filename. Each column shows a thin box for the interquartile range,
+  // a line at the median, and jittered dots for individual segments.
+
+  function _renderViolin(segments) {
+    const canvas = document.getElementById("violin-canvas");
+    const label  = document.getElementById("violin-label");
+    if (!segments || !segments.length) {
+      canvas.style.display = "none";
+      label.style.display  = "none";
+      return;
+    }
+    canvas.style.display = "block";
+    label.style.display  = "block";
+
+    // Group by filename.
+    const files = [...new Set(segments.map(s => s.filename))];
+    const metrics = ["jitter", "shimmer", "hnr"];
+    const labels  = { jitter: "Jitter (%)", shimmer: "Shimmer (%)", hnr: "HNR (dB)" };
+
+    // Dynamic canvas height so labels don't crowd.
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth || 820;
+    const H = 110 * metrics.length + 40;
+    canvas.width  = W * dpr;
+    canvas.height = H * dpr;
+    canvas.style.height = H + "px";
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    const padL = 60, padR = 16, padT = 12, padB = 22;
+    const panelH = (H - padT - padB) / metrics.length;
+    const plotW  = W - padL - padR;
+    const colW   = plotW / Math.max(files.length, 1);
+
+    ctx.font = "11px system-ui";
+
+    metrics.forEach((m, mi) => {
+      const yTop  = padT + mi * panelH;
+      const yMid  = yTop + panelH / 2;
+      // Collect values per file.
+      const series = files.map(f => segments
+        .filter(s => s.filename === f && s[m] !== null && s[m] !== undefined && !isNaN(s[m]))
+        .map(s => +s[m]));
+      // Global min/max for this metric.
+      const flat = series.flat();
+      if (!flat.length) { return; }
+      let lo = Math.min(...flat), hi = Math.max(...flat);
+      if (lo === hi) { lo -= 1; hi += 1; }
+      const pad = (hi - lo) * 0.06;
+      lo -= pad; hi += pad;
+
+      // Y-axis label
+      ctx.fillStyle = "#444";
+      ctx.textAlign = "right";
+      ctx.textBaseline = "middle";
+      ctx.fillText(labels[m], padL - 6, yMid);
+
+      // Horizontal axis line
+      ctx.strokeStyle = "#ddd";
+      ctx.beginPath();
+      ctx.moveTo(padL, yTop + panelH - 2);
+      ctx.lineTo(padL + plotW, yTop + panelH - 2);
+      ctx.stroke();
+
+      // min/max ticks
+      ctx.fillStyle = "#999";
+      ctx.textAlign = "right";
+      ctx.textBaseline = "top";
+      ctx.fillText(hi.toFixed(2), padL - 6, yTop + 2);
+      ctx.textBaseline = "bottom";
+      ctx.fillText(lo.toFixed(2), padL - 6, yTop + panelH - 4);
+
+      const valToY = v => yTop + panelH - 4 - ((v - lo) / (hi - lo)) * (panelH - 8);
+
+      files.forEach((f, fi) => {
+        const cx = padL + fi * colW + colW / 2;
+        const values = series[fi];
+        if (!values.length) return;
+        // Jittered dots
+        ctx.fillStyle = "rgba(37, 99, 235, 0.45)";
+        for (const v of values) {
+          const dx = (Math.random() - 0.5) * Math.min(colW * 0.6, 40);
+          ctx.beginPath();
+          ctx.arc(cx + dx, valToY(v), 2.2, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        // Sorted → IQR box + median line
+        const sorted = [...values].sort((a, b) => a - b);
+        const q = (p) => {
+          const idx = (sorted.length - 1) * p;
+          const lo_ = Math.floor(idx), hi_ = Math.ceil(idx);
+          if (lo_ === hi_) return sorted[lo_];
+          return sorted[lo_] + (sorted[hi_] - sorted[lo_]) * (idx - lo_);
+        };
+        const p25 = q(0.25), p50 = q(0.5), p75 = q(0.75);
+        const boxW = Math.min(colW * 0.35, 26);
+        // IQR box
+        ctx.strokeStyle = "#1e3a8a";
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(cx - boxW / 2, valToY(p75), boxW, valToY(p25) - valToY(p75));
+        // Median line
+        ctx.strokeStyle = "#dc2626";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(cx - boxW / 2, valToY(p50));
+        ctx.lineTo(cx + boxW / 2, valToY(p50));
+        ctx.stroke();
+
+        // File label on the last panel only, to avoid repetition.
+        if (mi === metrics.length - 1) {
+          ctx.fillStyle = "#333";
+          ctx.textAlign = "center";
+          ctx.textBaseline = "top";
+          const short = f.length > 18 ? f.slice(0, 16) + "…" : f;
+          ctx.fillText(short, cx, yTop + panelH + 2);
+        }
+      });
+    });
+  }
 
   // ── Table rendering ────────────────────────────────────────────────────────
 

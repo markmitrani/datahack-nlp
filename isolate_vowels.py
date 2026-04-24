@@ -2,29 +2,40 @@
 """
 Steps 1 + 2 of the voice-parameter pipeline: phoneme segmentation, keeping vowels.
 
-Given a Dutch speech recording (mp4 or wav), this script:
-  1. Extracts 16 kHz mono audio (ffmpeg) if the input is mp4.
+Batch mode. Scans an input directory for speech recordings (mp4 / wav), runs a
+phoneme recognizer on each, filters to IPA vowels, and writes ONE combined CSV
+with columns:
+
+    filename, phoneme, start, end, duration
+
+(`start` and `end` are in seconds, `duration` is in milliseconds.)
+
+What this does per file:
+  1. Extracts 16 kHz mono audio (ffmpeg) if the input is mp4/video.
   2. Loads facebook/wav2vec2-lv-60-espeak-cv-ft — a multilingual phoneme
-     recognizer that outputs eSpeak IPA. It handles Dutch without any
-     target-language flag.
-  3. Runs CTC inference in non-overlapping chunks on CPU to keep memory bounded.
+     recognizer that outputs eSpeak IPA. Dutch works without a target-language
+     flag; the model is loaded once and reused across files.
+  3. Runs CTC inference in non-overlapping chunks on CPU to bound memory.
   4. Takes argmax over the vocabulary → one predicted token per 20 ms frame.
   5. Turns per-frame predictions into phoneme segments with realistic durations
-     (see collapse_to_segments doc for the CTC-blipping heuristic).
-  6. Filters to IPA vowels (first char of the phoneme token) and writes CSV.
+     (see collapse_to_segments for the CTC-blipping heuristic).
+  6. Keeps only IPA vowels (first char of the phoneme token) and appends rows
+     to the combined output.
 
-Important note on the tokenizer: the HF tokenizer for this model pulls in the
-`phonemizer` library, which needs the `espeak` / `espeak-ng` binary. We don't
-need the tokenizer at all — we only decode ids to phoneme strings via vocab.json.
-So we load only the feature extractor + model, and read vocab.json directly.
-That keeps the script dependency-light: torch, transformers, soundfile,
-huggingface_hub, numpy, pandas — NO espeak required.
+Tokenizer sidestep: the HF tokenizer for this model pulls in `phonemizer`,
+which needs espeak. We don't need the tokenizer at all — we decode ids to
+phoneme strings via vocab.json. So we load only the feature extractor + model
+and read vocab.json directly. Dependencies: torch, transformers, soundfile,
+huggingface_hub, numpy, pandas. ffmpeg must be on PATH for mp4 input.
 
 Usage:
-    python isolate_vowels.py <input.mp4|wav> <output.csv> [model_dir]
-
-If model_dir is omitted, the model is auto-downloaded from Hugging Face (cached).
+    python isolate_vowels.py                                  # videos/ → output/vowels.csv
+    python isolate_vowels.py <input_dir>                      # custom input dir
+    python isolate_vowels.py <input_dir> <output.csv>         # custom output
+    python isolate_vowels.py <input_dir> <output.csv> <model> # local dir or HF id
 """
+from __future__ import annotations
+
 import json
 import shutil
 import subprocess
@@ -40,6 +51,8 @@ import torch
 from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2ForCTC
 
 DEFAULT_MODEL_ID = "facebook/wav2vec2-lv-60-espeak-cv-ft"
+DEFAULT_INPUT_DIR = "videos"
+DEFAULT_OUTPUT_CSV = "output/vowels.csv"
 
 # wav2vec2 has total stride 320 at 16 kHz → one output frame per 20 ms → 50 Hz.
 FRAME_HZ = 50.0
@@ -50,18 +63,16 @@ SR = 16000
 # (aː, eː, ɛi, ɔʏ, ʌu, aɪ, …) since eSpeak writes the vowel nucleus first.
 IPA_VOWELS = set("aɐɑɒæɘɜɚɛɝɞeəiɨɪɯɤoɔœøɶuʉʊʌʏy")
 
-# Max gap (in 20 ms frames) between same-phoneme emissions to still be
-# considered one cluster. Sustained vowels emit `a pad a pad a …`; a real pause
-# between two separate /a/ tokens would be much longer. 15 frames = 300 ms.
-MAX_INTRA_CLUSTER_GAP = 15
+# CTC decoding heuristics (see collapse_to_segments for rationale):
+MAX_INTRA_CLUSTER_GAP = 15   # 300 ms — merges sustained vowels
+MAX_EXTENSION_FRAMES = 5     # ±100 ms — caps extension into long silences
 
-# When splitting pad frames between neighboring clusters, cap the extension
-# from each cluster edge to at most this many frames. Without the cap, a
-# phoneme at the edge of a long silence would inherit hundreds of ms of
-# non-speech padding, distorting duration and jitter/shimmer measurements.
-# 5 frames = 100 ms is comfortably larger than typical vowel durations.
-MAX_EXTENSION_FRAMES = 5
+# Input extensions we'll pick up during a folder scan.
+AUDIO_EXTENSIONS = {".wav"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4a", ".mkv", ".webm"}
 
+
+# ── Audio loading ───────────────────────────────────────────────────────────
 
 def extract_audio_if_needed(path: str) -> tuple[str, Path | None]:
     """If path is video/non-wav, extract 16 kHz mono WAV to a temp file.
@@ -73,7 +84,6 @@ def extract_audio_if_needed(path: str) -> tuple[str, Path | None]:
         return str(p), None
     tmpdir = Path(tempfile.mkdtemp(prefix="isolate_vowels_"))
     wav_path = tmpdir / (p.stem + ".wav")
-    print(f"      extracting audio with ffmpeg → {wav_path}")
     subprocess.run(
         [
             "ffmpeg", "-y", "-i", str(p),
@@ -95,6 +105,16 @@ def load_audio(path: str) -> np.ndarray:
     return audio
 
 
+# ── Model loading ───────────────────────────────────────────────────────────
+
+def load_model(model_source: str):
+    """Returns (feature_extractor, model, id_to_token dict, pad_id)."""
+    fe = Wav2Vec2FeatureExtractor.from_pretrained(model_source)
+    model = Wav2Vec2ForCTC.from_pretrained(model_source).eval()
+    id_to_token, pad_id = load_vocab(model_source)
+    return fe, model, id_to_token, pad_id
+
+
 def load_vocab(model_source: str):
     """Read vocab.json → (id_to_token dict, pad_id).
 
@@ -105,9 +125,7 @@ def load_vocab(model_source: str):
         with open(p) as f:
             vocab = json.load(f)
     else:
-        # Fetch from HF hub (cached).
         from huggingface_hub import hf_hub_download
-
         vocab_path = hf_hub_download(repo_id=model_source, filename="vocab.json")
         with open(vocab_path) as f:
             vocab = json.load(f)
@@ -115,6 +133,8 @@ def load_vocab(model_source: str):
     pad_id = vocab["<pad>"]
     return id_to_token, pad_id
 
+
+# ── Inference ───────────────────────────────────────────────────────────────
 
 def chunked_predict(model, fe, audio, chunk_s=20.0) -> np.ndarray:
     """Run CTC inference in non-overlapping chunks; concat per-frame argmax ids."""
@@ -198,73 +218,114 @@ def is_vowel(token: str) -> bool:
     return token[0] in IPA_VOWELS
 
 
-def main(input_path: str, csv_path: str, model_source: str) -> None:
-    t_all = time.time()
+# ── Per-file processing ─────────────────────────────────────────────────────
 
-    print(f"[1/4] Loading model from {model_source} …")
-    t0 = time.time()
-    fe = Wav2Vec2FeatureExtractor.from_pretrained(model_source)
-    model = Wav2Vec2ForCTC.from_pretrained(model_source).eval()
-    id_to_token, pad_id = load_vocab(model_source)
-    print(
-        f"      vocab={len(id_to_token)}  pad_id={pad_id}  "
-        f"loaded in {time.time()-t0:.1f}s"
-    )
+def process_file(
+    path: str,
+    fe,
+    model,
+    id_to_token: dict,
+    pad_id: int,
+) -> pd.DataFrame:
+    """Run the phoneme pipeline on one file, return a vowels-only DataFrame.
 
-    print(f"[2/4] Preparing audio: {input_path}")
-    wav_path, tmpdir = extract_audio_if_needed(input_path)
+    Columns: filename, phoneme, start, end, duration (duration in ms).
+    filename is the original file name (with extension), e.g. "Aardema_maiden_t.mp4".
+    """
+    fname = Path(path).name
+    wav_path, tmpdir = extract_audio_if_needed(path)
     try:
         audio = load_audio(wav_path)
-        dur_s = len(audio) / SR
-        print(f"      {dur_s:.2f} s, {len(audio)} samples @ {SR} Hz mono")
-
-        print("[3/4] Running CTC inference (CPU, 20 s chunks) …")
-        t0 = time.time()
         pred_ids = chunked_predict(model, fe, audio)
-        print(
-            f"      {len(pred_ids)} frames "
-            f"(expected ≈ {int(dur_s * FRAME_HZ)})  in {time.time()-t0:.1f}s"
-        )
-
-        print("[4/4] Collapsing to segments and filtering to vowels …")
         segments = collapse_to_segments(pred_ids, id_to_token, pad_id)
-        rows = [
-            {
+
+        rows = []
+        for tok, s, e in segments:
+            if not is_vowel(tok):
+                continue
+            start_s = s / FRAME_HZ
+            end_s = e / FRAME_HZ
+            rows.append({
+                "filename": fname,
                 "phoneme": tok,
-                "start": round(s / FRAME_HZ, 3),
-                "end": round(e / FRAME_HZ, 3),
-            }
-            for tok, s, e in segments
-            if is_vowel(tok)
-        ]
-        df = pd.DataFrame(rows, columns=["phoneme", "start", "end"])
-        Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(csv_path, index=False)
+                "start": round(start_s, 3),
+                "end": round(end_s, 3),
+                "duration": round((end_s - start_s) * 1000, 3),
+            })
+        return pd.DataFrame(rows, columns=["filename", "phoneme", "start", "end", "duration"])
     finally:
         if tmpdir is not None:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-    print(f"\nTotal phoneme segments: {len(segments)}")
-    print(f"Vowel segments saved:   {len(df)}  →  {csv_path}")
-    if len(df):
-        print("\nFirst 15 rows:")
-        print(df.head(15).to_string(index=False))
-        print("\nVowel counts (top 10):")
-        print(df["phoneme"].value_counts().head(10).to_string())
-        durs = df["end"] - df["start"]
+
+def find_inputs(input_dir: str) -> list[Path]:
+    """Return all audio/video files in input_dir (non-recursive), sorted."""
+    d = Path(input_dir)
+    if not d.is_dir():
+        raise FileNotFoundError(f"input dir not found: {input_dir}")
+    exts = AUDIO_EXTENSIONS | VIDEO_EXTENSIONS
+    return sorted(p for p in d.iterdir() if p.is_file() and p.suffix.lower() in exts)
+
+
+# ── Main ────────────────────────────────────────────────────────────────────
+
+def main(input_dir: str, output_csv: str, model_source: str) -> None:
+    t_all = time.time()
+
+    inputs = find_inputs(input_dir)
+    if not inputs:
+        print(f"No audio/video files found in {input_dir}")
+        sys.exit(1)
+    print(f"Found {len(inputs)} input file(s) in {input_dir}")
+    for p in inputs:
+        print(f"  · {p.name}")
+
+    print(f"\nLoading model from {model_source} …")
+    t0 = time.time()
+    fe, model, id_to_token, pad_id = load_model(model_source)
+    print(f"  model loaded in {time.time() - t0:.1f}s  (vocab={len(id_to_token)})")
+
+    dfs = []
+    for idx, path in enumerate(inputs, 1):
+        print(f"\n[{idx}/{len(inputs)}] {path.name}")
+        t0 = time.time()
+        df = process_file(str(path), fe, model, id_to_token, pad_id)
+        elapsed = time.time() - t0
         print(
-            f"\nSegment durations (s): mean={durs.mean():.3f}  "
-            f"median={durs.median():.3f}  max={durs.max():.3f}  "
-            f">=80 ms: {(durs >= 0.08).sum()} / {len(df)}"
+            f"  {len(df)} vowel segments  "
+            f"(mean duration {df['duration'].mean():.0f} ms, "
+            f">=80 ms: {(df['duration'] >= 80).sum()})  "
+            f"in {elapsed:.1f}s"
         )
-    print(f"\nTotal wall time: {time.time()-t_all:.1f}s")
+        dfs.append(df)
+
+    combined = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(
+        columns=["filename", "phoneme", "start", "end", "duration"]
+    )
+    out = Path(output_csv)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    combined.to_csv(out, index=False)
+
+    print(f"\n── Done ──")
+    print(f"Files processed:  {len(inputs)}")
+    print(f"Total segments:   {len(combined)}")
+    print(f"Output CSV:       {out}")
+    print(f"Total wall time:  {time.time() - t_all:.1f}s")
+    if len(combined):
+        print("\nPer-file summary:")
+        summary = (
+            combined.groupby("filename")
+            .agg(n=("phoneme", "size"), mean_dur_ms=("duration", "mean"))
+            .round(1)
+        )
+        print(summary.to_string())
 
 
 if __name__ == "__main__":
-    if len(sys.argv) not in (3, 4):
+    if len(sys.argv) > 4:
         print(__doc__)
         sys.exit(1)
-    input_path = sys.argv[1]
-    csv_path = sys.argv[2]
-    model_source = sys.argv[3] if len(sys.argv) == 4 else DEFAULT_MODEL_ID
-    main(input_path, csv_path, model_source)
+    input_dir = sys.argv[1] if len(sys.argv) >= 2 else DEFAULT_INPUT_DIR
+    output_csv = sys.argv[2] if len(sys.argv) >= 3 else DEFAULT_OUTPUT_CSV
+    model_source = sys.argv[3] if len(sys.argv) >= 4 else DEFAULT_MODEL_ID
+    main(input_dir, output_csv, model_source)
